@@ -3,7 +3,7 @@ function ClearState(grainType, id, eTag, isDelete) {
   var collection = context.getCollection();
   var response = context.getResponse();
 
-  var query = 'SELECT * FROM c WHERE c.GrainType = "' + entity.GrainType + '" AND c.id = "' + entity.id + '"';
+  var query = 'SELECT * FROM c WHERE c.grainType = "' + entity.grainType + '" AND c.id = "' + entity.id + '"';
   var accept = collection.queryDocuments(collection.getSelfLink(), query, {},
     function (err, docs, responseOptions) {
       if (err) throw new Error("Error: " + err.message);

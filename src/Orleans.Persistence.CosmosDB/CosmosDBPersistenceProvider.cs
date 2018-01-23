@@ -5,20 +5,31 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Newtonsoft.Json.Serialization;
 using Orleans.Persistence.CosmosDB.Models;
 using Orleans.Persistence.CosmosDB.Options;
+using Orleans.Persistence.CosmosDB.Properties;
 using Orleans.Providers;
 using Orleans.Runtime;
 using Orleans.Serialization;
 using Orleans.Storage;
 using System;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace Orleans.Persistence.CosmosDB
 {
     public class CosmosDBPersistenceProvider : IStorageProvider
     {
-        private const string PARTITION_KEY = "/GrainType";
+        private const string PARTITION_KEY = "/grainType";
+        private const string NOT_FOUND_CODE = "NotFound";
+
+        private const string WRITE_STATE_SPROC = "WriteState";
+        private const string READ_STATE_SPROC = "ReadState";
+        private const string CLEAR_STATE_SPROC = "ClearState";
+
         private ILoggerFactory _loggerFactory;
         private ILogger _logger;
         private Guid _serviceId;
@@ -36,7 +47,13 @@ namespace Orleans.Persistence.CosmosDB
             this._loggerFactory = providerRuntime.ServiceProvider.GetRequiredService<ILoggerFactory>();
             this._logger = this._loggerFactory.CreateLogger(nameof(CosmosDBPersistenceProvider));
 
-            this._dbClient = new DocumentClient(new Uri(this._options.AccountEndpoint), this._options.AccountKey,
+            var serializerSettings = new JsonSerializerSettings
+            {
+                ContractResolver = new CamelCasePropertyNamesContractResolver(),
+                TypeNameHandling = TypeNameHandling.All
+            };
+
+            this._dbClient = new DocumentClient(new Uri(this._options.AccountEndpoint), this._options.AccountKey, serializerSettings,
                     new ConnectionPolicy
                     {
                         ConnectionMode = this._options.ConnectionMode,
@@ -48,17 +65,21 @@ namespace Orleans.Persistence.CosmosDB
             if (this._options.CanCreateResources)
             {
                 await TryCreateCosmosDBResources();
+
+                if (this._options.AutoUpdateSprocs) { 
+                    await UpdateStoredProcedures();
+                }
             }
         }
 
         public async Task ReadStateAsync(string grainType, GrainReference grainReference, IGrainState grainState)
         {
+            string id = GetKeyString(grainReference);
+
             try
             {
-                string id = GetKeyString(grainReference);
-
                 var spResponse = await this._dbClient.ExecuteStoredProcedureAsync<GrainStateEntity>(
-                        UriFactory.CreateStoredProcedureUri(this._options.DB, this._options.Collection, "ReadState"),
+                        UriFactory.CreateStoredProcedureUri(this._options.DB, this._options.Collection, READ_STATE_SPROC),
                         new RequestOptions { PartitionKey = new PartitionKey(grainType) },
                         grainType, id).ConfigureAwait(false);
 
@@ -68,9 +89,20 @@ namespace Orleans.Persistence.CosmosDB
                     grainState.ETag = spResponse.Response.ETag;
                 }
             }
+            catch (DocumentClientException dce)
+            {
+                if (NOT_FOUND_CODE.Equals(dce?.Error?.Code))
+                {
+                    // State is new, just return
+                    return;
+                }
+
+                this._logger.LogError(dce, $"Failure reading state for Grain Type {grainType} with Id {id}.");
+                throw dce;
+            }
             catch (Exception exc)
             {
-
+                this._logger.LogError(exc, $"Failure reading state for Grain Type {grainType} with Id {id}.");
                 throw;
             }
         }
@@ -90,8 +122,8 @@ namespace Orleans.Persistence.CosmosDB
                 };
 
                 var spResponse = await this._dbClient.ExecuteStoredProcedureAsync<string>(
-                        UriFactory.CreateStoredProcedureUri(this._options.DB, this._options.Collection, "WriteState"),
-                        new RequestOptions { PartitionKey = new PartitionKey(grainType) },
+                        UriFactory.CreateStoredProcedureUri(this._options.DB, this._options.Collection, WRITE_STATE_SPROC),
+                        //new RequestOptions { PartitionKey = new PartitionKey(grainType) },
                         entity).ConfigureAwait(false);
 
                 grainState.ETag = spResponse.Response;
@@ -110,7 +142,7 @@ namespace Orleans.Persistence.CosmosDB
             try
             {
                 var spResponse = await this._dbClient.ExecuteStoredProcedureAsync<string>(
-                        UriFactory.CreateStoredProcedureUri(this._options.DB, this._options.Collection, "ClearState"),
+                        UriFactory.CreateStoredProcedureUri(this._options.DB, this._options.Collection, CLEAR_STATE_SPROC),
                         new RequestOptions { PartitionKey = new PartitionKey(grainType) },
                         grainType, id, grainState.ETag, this._options.DeleteOnClear).ConfigureAwait(false);
 
@@ -152,6 +184,57 @@ namespace Orleans.Persistence.CosmosDB
                     //ConsistencyLevel = ConsistencyLevel.Strong,
                     OfferThroughput = this._options.CollectionThroughput
                 });
+
+            var collectionUri = UriFactory.CreateDocumentCollectionUri(this._options.DB, this._options.Collection);
+        }
+
+        private async Task UpdateStoredProcedures()
+        {
+            await this.UpdateStoredProcedure(READ_STATE_SPROC, Resources.ReadState);
+            await this.UpdateStoredProcedure(WRITE_STATE_SPROC, Resources.WriteState);
+            await this.UpdateStoredProcedure(CLEAR_STATE_SPROC, Resources.ClearState);
+        }
+
+        private async Task UpdateStoredProcedure(string name, string content)
+        {
+            // Partitioned Collections do not support upserts, so check if they exist, and delete/re-insert them if they've changed.
+            var insertStoredProc = false;
+
+            try
+            {
+                var storedProcUri = UriFactory.CreateStoredProcedureUri(this._options.DB, this._options.Collection, name);
+                var storedProcResponse = await this._dbClient.ReadStoredProcedureAsync(storedProcUri);
+                var storedProc = storedProcResponse.Resource;
+
+                if(storedProc == null || !Equals(storedProc.Body, content))
+                {
+                    insertStoredProc = true;
+                    await this._dbClient.DeleteStoredProcedureAsync(storedProcUri);
+                }
+            }
+            catch(DocumentClientException dce)
+            {
+                if(Equals(NOT_FOUND_CODE, dce?.Error?.Code))
+                {
+                    insertStoredProc = true;
+                }
+            }
+            catch(Exception exc)
+            {
+                this._logger.LogError(exc, $"Failure Updating Stored Procecure {name}");
+                throw exc;
+            }
+
+            if (insertStoredProc)
+            {
+                var newStoredProc = new StoredProcedure()
+                {
+                    Id = name,
+                    Body = content
+                };
+
+                await this._dbClient.CreateStoredProcedureAsync(UriFactory.CreateDocumentCollectionUri(this._options.DB, this._options.Collection), newStoredProc);
+            }
         }
     }
 }

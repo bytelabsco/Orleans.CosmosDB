@@ -9,12 +9,15 @@ namespace Orleans.Persistence.CosmosDB.Options
         private const string ORLEANS_DB = "Orleans";
         private const string ORLEANS_STORAGE_COLLECTION = "OrleansStorage";
         private const int ORLEANS_STORAGE_COLLECTION_THROUGHPUT = 400;
-        
+
+        private const string COSMOSDB_EMULATOR_ENDPOINT = "";
+        private const string COSMOSDB_EMULATOR_KEY = "";
+
         [JsonProperty(nameof(AccountEndpoint))]
-        public string AccountEndpoint { get; set; }
+        public string AccountEndpoint { get; set; } = COSMOSDB_EMULATOR_ENDPOINT;
 
         [JsonProperty(nameof(AccountKey))]
-        public string AccountKey { get; set; }
+        public string AccountKey { get; set; } = COSMOSDB_EMULATOR_KEY;
 
         [JsonProperty(nameof(DB))]
         public string DB { get; set; } = ORLEANS_DB;
@@ -38,5 +41,8 @@ namespace Orleans.Persistence.CosmosDB.Options
 
         [JsonProperty(nameof(DeleteOnClear))]
         public bool DeleteOnClear { get; set; }
+
+        [JsonProperty(nameof(AutoUpdateSprocs))]
+        public bool AutoUpdateSprocs { get; set; }
     }
 }
